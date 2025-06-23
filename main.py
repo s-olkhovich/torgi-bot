@@ -10,7 +10,7 @@ from telegram import Bot
 # Ваши данные (замените на реальные перед деплоем)
 TELEGRAM_TOKEN = "8064060634:AAGKtPIvf9R3oZS2dx2bqy0JMhJT_MBUI10"
 TELEGRAM_CHANNEL = "@gordep_ru"
-RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?biddType=ZK"
+RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?biddType=ZK&lotStatus=PUBLISHED,APPLICATIONS_SUBMISSION&fiasGUID=5ee526a0-fa5e-4f12-87b8-d05f1bf782fd&byFirstVersion=true"
 
 # Настройки
 DB_NAME = "sent_lots.db"
