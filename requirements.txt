@@ -1,2 +1,2 @@
-feedparser==6.0.10
+feedparser==6.0.10b1  # Версия с исправлением для Python 3.13
 python-telegram-bot==20.0
