@@ -1,115 +1,81 @@
-import os
-import time
-import sqlite3
-import logging
-from datetime import datetime, timedelta
-import requests
-from bs4 import BeautifulSoup
+# main.py
+import compat  # Должен быть первым импортом!
+import feedparser
 from telegram import Bot
-import random
+import sqlite3
+from datetime import datetime
+import time
+import logging
 
-# Конфигурация
+# Настройки
 TELEGRAM_TOKEN = "8064060634:AAGKtPIvf9R3oZS2dx2bqy0JMhJT_MBUI10"
 TELEGRAM_CHANNEL = "@gordep_ru"
+RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?biddType=ZK"
 DB_NAME = "sent_lots.db"
-CHECK_INTERVAL = 1800  # 30 минут
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
-    'Mozilla/5.0 (X11; Linux x86_64)'
-]
 
 # Логирование
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-class TorgiAPI:
-    @staticmethod
-    def get_rss():
-        """Получение данных через несколько источников"""
-        sources = [
-            TorgiAPI._try_direct_api,
-            TorgiAPI._try_opendata,
-            TorgiAPI._try_alternative
-        ]
-        
-        for source in sources:
-            data = source()
-            if data:
-                return data
-        return None
-
-    @staticmethod
-    def _try_direct_api():
-        """Прямое обращение к API"""
-        try:
-            url = "https://torgi.gov.ru/new/api/public/lotcards/rss?biddType=ZK"
-            headers = {'User-Agent': random.choice(USER_AGENTS)}
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            return response.content
-        except Exception as e:
-            logger.warning(f"Direct API failed: {str(e)}")
-            return None
-
-    @staticmethod
-    def _try_opendata():
-        """Через раздел открытых данных"""
-        try:
-            url = "https://torgi.gov.ru/opendata/7710349494-torgi/data.rss"
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            return response.content
-        except Exception as e:
-            logger.warning(f"OpenData failed: {str(e)}")
-            return None
-
-    @staticmethod
-    def _try_alternative():
-        """Альтернативный источник"""
-        try:
-            url = "https://api.allorigins.win/get?url=https://torgi.gov.ru/new/api/public/lotcards/rss?biddType=ZK"
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            return data['contents'].encode('utf-8') if data['contents'] else None
-        except Exception as e:
-            logger.warning(f"Alternative failed: {str(e)}")
-            return None
-
-# ... (остальные функции init_db, is_lot_sent, mark_lot_sent остаются без изменений)
-
-def parse_rss(xml_content):
-    """Парсинг RSS с обработкой ошибок"""
-    if not xml_content:
-        return []
-    
+def init_db():
+    """Инициализация базы данных"""
     try:
-        soup = BeautifulSoup(xml_content, 'xml')
-        items = soup.find_all('item')
-        
-        # Фильтрация дубликатов и невалидных записей
-        valid_items = []
-        for item in items:
-            try:
-                if item.title and item.link:
-                    valid_items.append(item)
-            except:
-                continue
-                
-        return valid_items[:10]  # Не более 10 лотов
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sent_lots (
+                id TEXT PRIMARY KEY,
+                sent_time TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        logger.info("База данных инициализирована")
     except Exception as e:
-        logger.error(f"Parse error: {str(e)}")
-        return []
+        logger.error(f"Ошибка БД: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
-def send_to_telegram(title, link, description=""):
-    """Улучшенная отправка в Telegram"""
+def is_lot_sent(lot_id):
+    """Проверка, был ли лот отправлен"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM sent_lots WHERE id=?", (lot_id,))
+        return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Ошибка проверки лота: {e}")
+        return True
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def mark_lot_sent(lot_id):
+    """Пометка лота как отправленного"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO sent_lots (id, sent_time) VALUES (?, ?)",
+            (lot_id, datetime.now())
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка отметки лота: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def send_to_telegram(title, link, description):
+    """Отправка сообщения в Telegram"""
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         message = (
-            f"🏷 *{title}*\n\n"
+            f"🏷 **{title}**\n\n"
+            f"📄 Описание: {description}\n\n"
             f"🔗 [Ссылка на лот]({link})"
         )
         bot.send_message(
@@ -120,52 +86,35 @@ def send_to_telegram(title, link, description=""):
         )
         return True
     except Exception as e:
-        logger.error(f"Telegram error: {str(e)}")
+        logger.error(f"Ошибка отправки: {e}")
         return False
 
 def check_new_lots():
-    """Основная функция проверки"""
-    logger.info("Checking for new lots...")
-    
-    # Получаем данные
-    xml_content = TorgiAPI.get_rss()
-    items = parse_rss(xml_content) if xml_content else []
-    
-    if not items:
-        logger.warning("No valid lots found")
-        return
-    
-    logger.info(f"Found {len(items)} lots")
-    
-    # Обработка лотов
-    new_lots = 0
-    for item in items:
-        try:
-            lot_id = item.guid.text if item.guid else item.link.text
-            title = item.title.text
-            link = item.link.text
-            
+    """Проверка новых лотов"""
+    logger.info("Проверяем новые лоты...")
+    try:
+        feed = feedparser.parse(RSS_URL)
+        new_lots = 0
+        
+        for entry in feed.entries:
+            lot_id = entry.get("id", entry.link)
             if not is_lot_sent(lot_id):
-                if send_to_telegram(title, link):
+                success = send_to_telegram(
+                    entry.title,
+                    entry.link,
+                    entry.get("description", "Нет описания")
+                )
+                if success:
                     mark_lot_sent(lot_id)
                     new_lots += 1
-                    time.sleep(random.uniform(1, 3))  # Случайная задержка
-        except Exception as e:
-            logger.error(f"Lot processing error: {str(e)}")
-    
-    logger.info(f"Sent {new_lots} new lots")
+                    time.sleep(1)  # Задержка между отправками
+        
+        logger.info(f"Найдено новых лотов: {new_lots}")
+    except Exception as e:
+        logger.error(f"Ошибка при проверке лотов: {e}")
 
 if __name__ == "__main__":
     init_db()
-    logger.info("Service started")
-    
     while True:
-        try:
-            check_new_lots()
-            time.sleep(CHECK_INTERVAL)
-        except KeyboardInterrupt:
-            logger.info("Service stopped")
-            break
-        except Exception as e:
-            logger.error(f"Main loop error: {str(e)}")
-            time.sleep(300)
+        check_new_lots()
+        time.sleep(1800)  # Проверка каждые 30 минут
