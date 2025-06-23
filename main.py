@@ -1,65 +1,36 @@
-import feedparser
-from telegram import Bot
-import sqlite3
-from datetime import datetime
+import os
 import time
+import sqlite3
 import logging
+from datetime import datetime
+from bs4 import BeautifulSoup
 import requests
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
-import random
+from telegram import Bot
 
-# Настройки
+# Ваши данные (замените на реальные перед деплоем)
 TELEGRAM_TOKEN = "8064060634:AAGKtPIvf9R3oZS2dx2bqy0JMhJT_MBUI10"
 TELEGRAM_CHANNEL = "@gordep_ru"
 RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?biddType=ZK"
+
+# Настройки
 DB_NAME = "sent_lots.db"
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-]
+CHECK_INTERVAL = 1800  # 30 минут
+USER_AGENT = "Mozilla/5.0 (compatible; TorgiGovBot/1.0)"
 
 # Логирование
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Настройка сессии с повторами
-session = requests.Session()
-retries = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[500, 502, 503, 504, 429]
-)
-session.mount('https://', HTTPAdapter(max_retries=retries))
-
-def get_random_headers():
-    return {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'application/xml',
-        'Accept-Language': 'ru-RU,ru;q=0.9',
-    }
-
-def safe_feed_parse(url):
-    """Безопасный парсинг RSS с обработкой ошибок"""
-    try:
-        headers = get_random_headers()
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
-        response.raise_for_status()
-        return feedparser.parse(response.content)
-    except Exception as e:
-        logger.error(f"Ошибка при запросе RSS: {str(e)}")
-        return feedparser.parse("")
-
 def init_db():
-    """Инициализация базы данных"""
+    """Инициализация базы данных SQLite"""
+    conn = None
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -70,28 +41,31 @@ def init_db():
             )
         ''')
         conn.commit()
+        logger.info("База данных готова")
     except Exception as e:
-        logger.error(f"Ошибка инициализации БД: {str(e)}")
+        logger.error(f"Ошибка БД: {e}")
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
 
 def is_lot_sent(lot_id):
     """Проверка, был ли лот отправлен ранее"""
+    conn = None
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM sent_lots WHERE id=?", (lot_id,))
         return cursor.fetchone() is not None
     except Exception as e:
-        logger.error(f"Ошибка проверки лота: {str(e)}")
+        logger.error(f"Ошибка проверки лота: {e}")
         return True
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
 
 def mark_lot_sent(lot_id):
     """Пометка лота как отправленного"""
+    conn = None
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -101,9 +75,9 @@ def mark_lot_sent(lot_id):
         )
         conn.commit()
     except Exception as e:
-        logger.error(f"Ошибка отметки лота: {str(e)}")
+        logger.error(f"Ошибка отметки лота: {e}")
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
 
 def send_to_telegram(title, link, description):
@@ -111,76 +85,93 @@ def send_to_telegram(title, link, description):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         message = (
-            f"🏷 **{title}**\n\n"
+            f"🏷 <b>{title}</b>\n\n"
             f"📄 Описание: {description}\n\n"
-            f"🔗 [Ссылка на лот]({link})"
+            f"🔗 <a href='{link}'>Ссылка на лот</a>"
         )
         bot.send_message(
             chat_id=TELEGRAM_CHANNEL,
             text=message,
-            parse_mode="Markdown",
+            parse_mode='HTML',
             disable_web_page_preview=True
         )
         return True
     except Exception as e:
-        logger.error(f"Ошибка отправки в Telegram: {str(e)}")
+        logger.error(f"Ошибка отправки: {e}")
         return False
 
-def check_new_lots():
-    """Проверка новых лотов с защитой от блокировки"""
+def get_rss_feed():
+    """Получение RSS с обработкой ошибок"""
     try:
-        # Случайная задержка от 5 до 15 секунд
-        delay = random.randint(5, 15)
-        time.sleep(delay)
-        
-        logger.info("Начало проверки новых лотов...")
-        feed = safe_feed_parse(RSS_URL)
-        
-        # Логирование для диагностики
-        logger.info(f"Статус RSS: {getattr(feed, 'status', 'N/A')}")
-        logger.info(f"Найдено лотов: {len(feed.entries)}")
-        
-        new_lots = 0
-        for entry in feed.entries:
-            try:
-                lot_id = entry.get('id', entry.link)
-                if not is_lot_sent(lot_id):
-                    if send_to_telegram(
-                        entry.title,
-                        entry.link,
-                        entry.get('description', 'Нет описания')
-                    ):
-                        mark_lot_sent(lot_id)
-                        new_lots += 1
-                        # Задержка между отправками
-                        time.sleep(random.uniform(1.0, 3.0))
-            except Exception as e:
-                logger.error(f"Ошибка обработки лота: {str(e)}")
-                continue
-                
-        logger.info(f"Успешно отправлено новых лотов: {new_lots}")
-        return True
-        
+        response = requests.get(
+            RSS_URL,
+            headers={'User-Agent': USER_AGENT},
+            timeout=15
+        )
+        response.raise_for_status()
+        return response.content
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка запроса RSS: {e}")
+        return None
+
+def parse_rss_feed(xml_content):
+    """Парсинг RSS ленты"""
+    if not xml_content:
+        return []
+    
+    try:
+        soup = BeautifulSoup(xml_content, 'xml')
+        return soup.find_all('item')
     except Exception as e:
-        logger.error(f"Критическая ошибка при проверке лотов: {str(e)}")
-        return False
+        logger.error(f"Ошибка парсинга RSS: {e}")
+        return []
+
+def check_new_lots():
+    """Основная функция проверки лотов"""
+    logger.info("Проверка новых лотов...")
+    
+    # Получаем и парсим RSS
+    xml_content = get_rss_feed()
+    items = parse_rss_feed(xml_content)
+    
+    if not items:
+        logger.warning("Лоты не найдены или ошибка парсинга")
+        return
+    
+    logger.info(f"Найдено лотов: {len(items)}")
+    
+    # Ограничиваем количество за одну проверку
+    new_lots = 0
+    for item in items[:10]:  # Не более 10 за раз
+        try:
+            lot_id = item.guid.text if item.guid else item.link.text
+            if not is_lot_sent(lot_id):
+                title = item.title.text if item.title else "Без названия"
+                link = item.link.text if item.link else "#"
+                description = item.description.text if item.description else "Нет описания"
+                
+                if send_to_telegram(title, link, description):
+                    mark_lot_sent(lot_id)
+                    new_lots += 1
+                    time.sleep(2)  # Задержка между отправками
+        except Exception as e:
+            logger.error(f"Ошибка обработки лота: {e}")
+    
+    logger.info(f"Отправлено новых лотов: {new_lots}")
 
 if __name__ == "__main__":
     init_db()
-    logger.info("Бот запущен")
+    logger.info("Бот запущен с настройками:")
+    logger.info(f"Telegram канал: {TELEGRAM_CHANNEL}")
+    logger.info(f"RSS URL: {RSS_URL}")
     
     while True:
         try:
-            if not check_new_lots():
-                # Увеличенная задержка при ошибках
-                time.sleep(60)
-            
-            # Основной интервал проверки (30 минут)
-            time.sleep(1800)
-            
+            check_new_lots()
+            time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Бот остановлен")
             break
         except Exception as e:
-            logger.error(f"Необработанная ошибка: {str(e)}")
-            time.sleep(300)  # Пауза 5 минут при критических ошибках
+            logger.error(f"Критическая ошибка: {e}")
+            time.sleep(300)  # Пауза при ошибках
